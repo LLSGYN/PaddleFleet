@@ -362,3 +362,148 @@ def find_blocks_topp(x: paddle.Tensor, p: float):
     )
 
     return output_mask.reshape(original_shape)
+
+def find_blocks_chunked(
+    input_tensor, current_index, threshold, num_to_choose, decoding: bool, mode: str = "both", causal=True
+):
+    """
+        Finds and selects relevant blocks of attention for transformer-based models based on a 
+        threshold or a predefined number of blocks.
+
+        Parameters:
+        - input_tensor (paddle.Tensor): The input tensor of shape (batch_size, head_num, chunk_num, block_num).
+        - current_index (int): The current index in the sequence processing.
+        - threshold (float or None): A threshold value used to determine the minimum attention weight sum.
+        - num_to_choose (int or None): The number of blocks to be selected, ensuring sufficient information retrieval.
+        - decoding (bool): If True, operates in decoding mode; otherwise, it's in encoding mode.
+        - mode (str): Defines the processing mode, either 'both', 'prefill', or 'decode'.
+        - causal (bool): If True, applies causal masking to prevent future information leakage.
+
+        Returns:
+        - paddle.Tensor: A boolean mask of shape (batch_size, head_num, chunk_num, block_num),
+        indicating which blocks should be attended to.
+    """
+    assert threshold is None or num_to_choose is None
+    batch_size, head_num, chunk_num, block_num = input_tensor.shape
+    # 0 -- -- -- -- current_index
+    # 0 -- -- -- -- -- current_index+1
+    # 0 -- -- -- -- -- ----------- current_index + chunk_num - 1
+    if mode == "prefill" and decoding:
+        return paddle.ones_like(input_tensor, dtype=paddle.bool)
+    if mode == "decode" and not decoding:
+        mask = paddle.ones_like(input_tensor, dtype=paddle.bool)
+        if causal:
+            mask[:, :, :, current_index : current_index + chunk_num] = paddle.tril(
+                paddle.ones(1, head_num, chunk_num, chunk_num)
+            )
+            mask[:, :, current_index + chunk_num :, :] = 0
+            return paddle.cat(
+                [
+                    paddle.ones_like(input_tensor, dtype=paddle.bool)[:, :, 0 : current_index + 1],
+                    paddle.zeros_like(input_tensor, dtype=paddle.bool)[:, :, current_index + 1 :],
+                ],
+                dim=-1,
+            )
+        else:
+            return mask
+    input_tensor = input_tensor.astype("float32")
+    
+    if threshold is not None:
+        total_sum = input_tensor.sum(dim=-1, keepdim=True)
+        if isinstance(threshold, paddle.Tensor):
+            threshold = threshold.astype("float32")
+            required_sum = total_sum * threshold.unsqueeze(0).unsqueeze(-1).unsqueeze(
+                -1
+            ).expand((batch_size, head_num, chunk_num, 1))
+        else:
+            required_sum = total_sum * threshold
+        if causal:
+            mask = paddle.zeros_like(input_tensor, dtype=paddle.bool)
+            mask[:, :, :, 0] = 1
+            mask[:, :, :, current_index : current_index + chunk_num] = (
+                paddle.eye(chunk_num)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .expand(1, head_num, chunk_num, chunk_num)
+            )
+            other_values = input_tensor.masked_fill(mask, 0.0)
+            sorted_values, _ = paddle.compat.sort(
+                other_values, dim=-1, descending=True
+            )
+
+            sorted_values = paddle.cat(
+                [
+                    paddle.zeros(
+                        (batch_size, head_num, chunk_num, 1)
+                    ),
+                    paddle.where(mask, input_tensor, 0.0).sum(
+                        dim=-1, keepdim=True
+                    ),
+                    sorted_values[:, :, :, :-2],
+                ],
+                dim=-1,
+            )
+
+            _, index = paddle.compat.sort(
+                paddle.where(mask, 100000 * (1 + input_tensor), input_tensor),
+                dim=-1,
+                descending=True,
+            )
+            cumulative_sum_without_self = paddle.cat(
+                [
+                    paddle.zeros(
+                        (batch_size, head_num, chunk_num, 1)
+                    ),
+                    sorted_values[:, :, :, 0:-1],
+                ],
+                dim=-1,
+            ).cumsum(dim=-1)
+
+            index_mask = cumulative_sum_without_self < required_sum
+            index = paddle.where(index_mask,index,0)
+            mask = mask.view(batch_size,head_num*chunk_num,block_num)
+            index = index.view(batch_size,head_num*chunk_num,block_num)
+            mask[:,paddle.arange(mask.shape[1]).unsqueeze(dim=-1),index] = True
+            mask = mask.view(batch_size,head_num,chunk_num,block_num)
+            # assert(bool((paddle.where(mask,input_tensor,0).sum(dim=-1,keepdim=True) >= required_sum*0.99).all()))
+        else:
+            mask = paddle.zeros_like(input_tensor, dtype=paddle.bool)
+            sorted_values, index = paddle.compat.sort(
+                input_tensor, dim=-1, descending=True
+            )
+            cumulative_sum_without_self = paddle.cat(
+                [
+                    paddle.zeros((batch_size, head_num, chunk_num, 1)),
+                    sorted_values[:, :, :, 0:-1],
+                ],
+                dim=-1,
+            ).cumsum(dim=-1)
+            index_mask = cumulative_sum_without_self < required_sum
+            index = paddle.where(index_mask, index, 0)
+            mask = mask.view(batch_size, head_num * chunk_num, block_num)
+            index = index.view(batch_size, head_num * chunk_num, block_num)
+            mask[
+                :,
+                paddle.arange(mask.shape[1]).unsqueeze(dim=-1),
+                index,
+            ] = True
+            mask = mask.view(batch_size, head_num, chunk_num, block_num)
+    else:
+        raise NotImplementedError("block num chunk prefill not impleted")
+    
+    try:
+        if causal:
+            assert (~mask[:, :, :, current_index + chunk_num :]).all()
+    except:
+        mask[:, :, :, current_index + chunk_num :] = False
+
+    if causal:
+        if decoding:
+            assert mask[:, :, :, 0].all() and mask[:, :, :, -1].all()
+        else:
+            lambda_mask = paddle.zeros_like(input_tensor,dtype=bool)
+            lambda_mask[:,:,:,0] = 1
+            lambda_mask[:,:,:,current_index:current_index+chunk_num] = paddle.eye(chunk_num).unsqueeze(0).unsqueeze(0).expand(1,head_num,chunk_num,chunk_num)
+            assert(paddle.where(lambda_mask,mask,True).all())
+
+    return mask

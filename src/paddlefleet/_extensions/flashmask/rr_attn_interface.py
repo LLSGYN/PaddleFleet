@@ -18,6 +18,8 @@ def rr_attention(
     causal: bool = False,
     dropout: float = 0.0,
     training: bool = True,
+    keep_sink: bool = True,
+    keep_last: bool = True,
     return_softmax_lse: bool = False,
     return_seed_offset: bool = False,
 ) -> paddle.Tensor:
@@ -125,6 +127,10 @@ def rr_attention(
 
         # Combine masks: boundary protection + top-p sparsity
         block_mask = paddle.logical_or(boundary_mask, topp_mask).astype(paddle.int32)
+        if keep_sink:
+            block_mask[:, :, :, 0] = 1
+        if keep_last:
+            block_mask[:, :, -1, :] = 1
 
     # Apply sparse attention with computed block mask
     return F.flashmask_attention(

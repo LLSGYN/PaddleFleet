@@ -25,6 +25,7 @@ from .block_mask_utils import (
     check_fully_masked_state,
     check_partially_masked_state,
     find_blocks_topp,
+    find_blocks_chunked,
 )
 from .index_utils import (
     prepare_maxmin,
@@ -203,6 +204,8 @@ def gemm_fuse_softmax_causal(
 
     # Causal / FA3 Setup
     shift = seqlen_k - seqlen_q
+    # xattn v14 applies causal in reshaped (stride) space.
+    shift_stride = shift // STRIDE
 
     # k_safe_end: K blocks strictly to the left of the diagonal (Safe to compute fully)
     # Condition: k_block_end <= q_block_start + shift
@@ -358,22 +361,17 @@ def gemm_fuse_softmax_causal(
                 causal=True,
                 mode=mode,
             )
-            global_offs_k = iter * BLOCK_SIZE + offs_tokens_k
-
-            # Causal Condition: k_idx > q_idx + shift => Masked
-            # Mask value: 0.0 (Identity for sum reduction of logits)
-            causal_mask_token = global_offs_k[None, :] > (
-                offs_tokens_q[:, None] + shift
-            )
-            X = tl.where(causal_mask_token, 0.0, X)
-
-            # Reduce token logits to get stride score
+            # Reduce token logits to stride space first, then apply
+            # stride-level causal mask to align with xattn v14 behavior.
             X = X.reshape(ratio, ratio, STRIDE).sum(axis=2)
-            # fully_masked_by_fm = dense_flashmask.reshape(ratio, ratio, STRIDE).min(axis=2) == 1
-            causal_fuse_fm = causal_mask_token | dense_flashmask
-            fully_masked_by_fm = (
-                causal_fuse_fm.reshape(ratio, ratio, STRIDE).min(axis=2) == 1
+            global_offs_k_stride = iter * ratio + offs_stride_k
+            causal_mask_stride = global_offs_k_stride[None, :] > (
+                offs_q_stride[:, None] + shift_stride
             )
+            fully_masked_by_fm = (
+                dense_flashmask.reshape(ratio, ratio, STRIDE).min(axis=2) == 1
+            )
+            fully_masked_by_fm = fully_masked_by_fm | causal_mask_stride
             X = tl.where(fully_masked_by_fm, -1.0e6, X)
 
             X = tl.where(fully_masked_stride_mask, -1.0e6, X)
@@ -580,26 +578,21 @@ def gemm_fuse_softmax_causal(
                 causal=True,
                 mode=mode,
             )
-
-            global_offs_k = iter * BLOCK_SIZE + offs_tokens_k
-
-            # Causal Condition: k_idx > q_idx + shift => Masked
-            causal_mask_token = global_offs_k[None, :] > (
-                offs_tokens_q[:, None] + shift
-            )
-
-            X = tl.where(causal_mask_token, 0.0, X)
-
-            # Reduce token logits to get stride score
+            # Reduce token logits to stride space first, then apply
+            # stride-level causal mask to align with xattn v14 behavior.
             X = X.reshape(ratio, ratio, STRIDE).sum(axis=2)
-            causal_fuse_fm = causal_mask_token | dense_flashmask
-            fully_masked_by_fm = (
-                causal_fuse_fm.reshape(ratio, ratio, STRIDE).min(axis=2) == 1
+            global_offs_k_stride = iter * ratio + offs_stride_k
+            causal_mask_stride = global_offs_k_stride[None, :] > (
+                offs_q_stride[:, None] + shift_stride
             )
+            fully_masked_by_fm = (
+                dense_flashmask.reshape(ratio, ratio, STRIDE).min(axis=2) == 1
+            )
+            fully_masked_by_fm = fully_masked_by_fm | causal_mask_stride
 
             X = tl.where(fully_masked_by_fm, -1.0e6, X)
             has_partial = check_dense_contains_partial_stride(
-                causal_fuse_fm,
+                dense_flashmask,
                 q_token_mask=mask_q,
                 k_token_mask=curr_token_load_mask,
                 BLOCK_SIZE=BLOCK_SIZE,
@@ -985,6 +978,10 @@ def _extract_raw_ptrs(
     """
     mode = startend_row_indices.shape[-1]
     _require(mode in (1, 2, 4), f"Unsupported mode={mode}, expected 1/2/4")
+    _require(
+        not (causal and mode == 4),
+        "mode=4 is only valid when causal=False in FlashMask semantics",
+    )
 
     # 统一保证 contiguous
     x = startend_row_indices.contiguous()
@@ -1162,5 +1159,8 @@ def rr_attn_estimate_triton_func(
     return (
         attn_sums,
         boundary_protection_mask,
-        find_blocks_topp(attn_sums, threshold),
+        # find_blocks_topp(attn_sums, threshold),
+        find_blocks_chunked(
+            attn_sums, 0, threshold, None, decoding=False, mode="prefill", causal=causal,
+        )
     )
