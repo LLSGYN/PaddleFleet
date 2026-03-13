@@ -433,7 +433,7 @@ def find_blocks_chunked(
 
             sorted_values = paddle.cat(
                 [
-                    paddle.zeros(
+                    input_tensor.new_zeros(
                         (batch_size, head_num, chunk_num, 1)
                     ),
                     paddle.where(mask, input_tensor, 0.0).sum(
@@ -451,7 +451,7 @@ def find_blocks_chunked(
             )
             cumulative_sum_without_self = paddle.cat(
                 [
-                    paddle.zeros(
+                    sorted_values.new_zeros(
                         (batch_size, head_num, chunk_num, 1)
                     ),
                     sorted_values[:, :, :, 0:-1],
@@ -473,7 +473,7 @@ def find_blocks_chunked(
             )
             cumulative_sum_without_self = paddle.cat(
                 [
-                    paddle.zeros((batch_size, head_num, chunk_num, 1)),
+                    sorted_values.new_zeros((batch_size, head_num, chunk_num, 1)),
                     sorted_values[:, :, :, 0:-1],
                 ],
                 dim=-1,
