@@ -46,21 +46,6 @@ from scripts.speed_test import (  # noqa: E402
 DEFAULT_SEQ_LENS = "8192,16384,32768,65536,131072"
 DEFAULT_THRESHOLDS = "0.9,0.95"
 DEFAULT_WINDOW_SIZES = "128,256,512,1024,2048,4096,8192"
-CSV_FIELDS = [
-    "model",
-    "model_type",
-    "dtype",
-    "device",
-    "fa_version",
-    "method",
-    "seq_len",
-    "threshold",
-    "window_size",
-    "stride",
-    "ttft_mean_ms",
-]
-
-
 def parse_int_list(value: str | list[int]) -> list[int]:
     if isinstance(value, str):
         values = [int(item) for item in value.split(",") if item.strip()]
@@ -285,6 +270,8 @@ def iter_cases(
     window_sizes: list[int],
 ) -> list[Case]:
     cases = []
+    for seq_len in seq_lens:
+        cases.append(Case("full", seq_len, threshold=1.0))
     for threshold in thresholds:
         for seq_len in seq_lens:
             cases.append(Case("rrattn", seq_len, threshold=threshold))
@@ -336,12 +323,15 @@ def benchmark_case(
         clear_cache(device)
 
     ttft_mean = summarize_mean(ttft_times)
+    saved_stride = ""
+    if case.method == "rrattn":
+        saved_stride = stride
     return {
         "method": case.method,
         "seq_len": case.seq_len,
         "threshold": "" if case.threshold is None else case.threshold,
         "window_size": "" if case.window_size is None else case.window_size,
-        "stride": stride if case.method == "rrattn" else "",
+        "stride": saved_stride,
         "ttft_mean_ms": ttft_mean,
     }
 
@@ -371,12 +361,58 @@ def output_path(model_name: str, output_dir: str) -> Path:
     )
 
 
-def print_case_result(row: dict):
-    config = (
-        f"threshold={row['threshold']}"
-        if row["method"] == "rrattn"
-        else f"window_size={row['window_size']}"
+def format_threshold(threshold: float) -> str:
+    return f"{float(threshold):.2f}"
+
+
+def case_column_name(row: dict) -> str:
+    if row["method"] == "full":
+        return "full"
+    if row["method"] == "rrattn":
+        return f"rrattn_t{format_threshold(row['threshold'])}"
+    return f"swa_w{row['window_size']}"
+
+
+def csv_columns(
+    thresholds: list[float],
+    window_sizes: list[int],
+) -> list[str]:
+    columns = ["full"]
+    columns.extend(
+        f"rrattn_t{format_threshold(threshold)}" for threshold in thresholds
     )
+    columns.extend(f"swa_w{window_size}" for window_size in window_sizes)
+    return columns
+
+
+def write_wide_csv(
+    path: Path,
+    rows: list[dict],
+    seq_lens: list[int],
+    thresholds: list[float],
+    window_sizes: list[int],
+):
+    columns = csv_columns(thresholds, window_sizes)
+    table = {
+        seq_len: {"seq_len": seq_len, **{column: "" for column in columns}}
+        for seq_len in seq_lens
+    }
+    for row in rows:
+        seq_len = int(row["seq_len"])
+        table[seq_len][case_column_name(row)] = row["ttft_mean_ms"]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["seq_len", *columns])
+        writer.writeheader()
+        writer.writerows(table[seq_len] for seq_len in seq_lens)
+
+
+def print_case_result(row: dict):
+    if row["method"] in {"rrattn", "full"}:
+        config = f"threshold={row['threshold']}"
+    else:
+        config = f"window_size={row['window_size']}"
     print(
         "{method:<6} seq_len={seq_len:<6} {config:<16} "
         "ttft_mean={ttft:.2f}ms".format(
@@ -425,9 +461,10 @@ def dry_run(
     cases = iter_cases(seq_lens, thresholds, window_sizes)
     print(f"case_count={len(cases)}")
     for case in cases:
-        if case.method == "rrattn":
+        if case.method in {"rrattn", "full"}:
             print(
-                f"rrattn seq_len={case.seq_len} threshold={case.threshold}"
+                f"{case.method} seq_len={case.seq_len} "
+                f"threshold={case.threshold}"
             )
         else:
             print(f"swa seq_len={case.seq_len} window_size={case.window_size}")
@@ -528,6 +565,13 @@ def main(
                     threshold=case.threshold,
                     stride=stride,
                 )
+            elif case.method == "full":
+                set_patched_attention_config(
+                    model,
+                    method="full",
+                    threshold=case.threshold,
+                    stride=1,
+                )
             else:
                 set_patched_attention_config(model, method="swa")
 
@@ -552,11 +596,13 @@ def main(
             print_case_result(row)
 
     saved_path = output_path(model_name, output_dir)
-    saved_path.parent.mkdir(parents=True, exist_ok=True)
-    with saved_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+    write_wide_csv(
+        saved_path,
+        rows,
+        seq_len_list,
+        threshold_list,
+        window_size_list,
+    )
     print(f"saved: {saved_path}")
 
 
