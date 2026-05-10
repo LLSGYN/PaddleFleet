@@ -191,7 +191,7 @@ def patched_swa_attention_branch(profiler: SwaProfiler):
             paddle.cuda.synchronize()
             profiler.add_attn_time(start_event.elapsed_time(end_event))
 
-        module.sparse_ratio = 0.0
+        clear_sparse_ratio(module)
         attn_output = attn_output.reshape(
             [attn_output.shape[0], attn_output.shape[1], -1]
         ).contiguous()
@@ -204,7 +204,20 @@ def patched_swa_attention_branch(profiler: SwaProfiler):
         patch_utils.attention_branch = original_attention_branch
 
 
-def set_patched_attention_method(model, method: str) -> int:
+def clear_sparse_ratio(module):
+    buffers = getattr(module, "_buffers", None)
+    if buffers is not None and "sparse_ratio" in buffers:
+        module.sparse_ratio = None
+    else:
+        module.sparse_ratio = 0.0
+
+
+def set_patched_attention_config(
+    model,
+    method: str,
+    threshold: float | None = None,
+    stride: int | None = None,
+) -> int:
     from rrattn.patch_utils import get_decoder_layers
 
     count = 0
@@ -216,6 +229,10 @@ def set_patched_attention_method(model, method: str) -> int:
         if not hasattr(attn, "_rrattn_original_forward"):
             continue
         attn.method = method
+        if threshold is not None:
+            attn.threshold = threshold
+        if stride is not None:
+            attn.stride = stride
         seen.add(id(attn))
         count += 1
 
@@ -226,6 +243,10 @@ def set_patched_attention_method(model, method: str) -> int:
             if not hasattr(attn, "_rrattn_original_forward"):
                 continue
             attn.method = method
+            if threshold is not None:
+                attn.threshold = threshold
+            if stride is not None:
+                attn.stride = stride
             seen.add(id(attn))
             count += 1
 
@@ -546,6 +567,12 @@ def main(
     model = load_model(model_name, model_type, dtype)
     model.eval()
     patch_fn = load_patch(model_type)
+    patch_fn(
+        model,
+        method="rrattn",
+        threshold=threshold_list[0],
+        stride=stride,
+    )
     tokenizer = load_tokenizer(model_name)
     samples = quick_get_random_kv_samples(
         model_name,
@@ -570,7 +597,7 @@ def main(
     with patched_swa_attention_branch(swa_profiler):
         for case in cases:
             if case.method == "rrattn":
-                patch_fn(
+                set_patched_attention_config(
                     model,
                     method="rrattn",
                     threshold=case.threshold,
@@ -578,8 +605,7 @@ def main(
                 )
                 profile_fns = rr_profile_fns
             else:
-                patch_fn(model, method="full", threshold=1.0, stride=stride)
-                set_patched_attention_method(model, "swa")
+                set_patched_attention_config(model, method="swa")
                 profile_fns = swa_profile_fns
 
             row = benchmark_case(
