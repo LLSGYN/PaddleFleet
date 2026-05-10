@@ -24,7 +24,6 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import paddle
@@ -38,7 +37,6 @@ from scripts.speed_test import (  # noqa: E402
     infer_model_type,
     load_model,
     load_patch,
-    load_profile_fns,
     load_tokenizer,
     quick_get_random_kv_samples,
     synchronize,
@@ -59,12 +57,7 @@ CSV_FIELDS = [
     "threshold",
     "window_size",
     "stride",
-    "forward_mean_ms",
-    "forward_median_ms",
-    "forward_min_ms",
-    "attn_mean_ms",
-    "estimate_mean_ms",
-    "operator_mean_ms",
+    "ttft_mean_ms",
 ]
 
 
@@ -104,26 +97,8 @@ def build_swa_startend_row_indices(
     )
 
 
-class SwaProfiler:
-    def __init__(self, enable: bool):
-        self.enable = enable
-        self.attn_time_ms = 0.0
-
-    def reset(self):
-        self.attn_time_ms = 0.0
-
-    def add_attn_time(self, attn_time_ms: float):
-        self.attn_time_ms += float(attn_time_ms)
-
-    def get_attn_time(self) -> float:
-        return float(self.attn_time_ms)
-
-    def get_estimate_func_time(self) -> float:
-        return 0.0
-
-
 @contextlib.contextmanager
-def patched_swa_attention_branch(profiler: SwaProfiler):
+def patched_swa_attention_branch():
     import rrattn.patch_utils as patch_utils
     from paddle.nn.functional.flash_attention import flashmask_attention
     from paddleformers.nn.attention.eager_attention import repeat_kv
@@ -168,12 +143,6 @@ def patched_swa_attention_branch(profiler: SwaProfiler):
         key_states = key_states.transpose(1, 2).contiguous()
         value_states = value_states.transpose(1, 2).contiguous()
 
-        if profiler.enable:
-            paddle.cuda.synchronize()
-            start_event = paddle.cuda.Event(enable_timing=True)
-            end_event = paddle.cuda.Event(enable_timing=True)
-            start_event.record()
-
         attn_output = flashmask_attention(
             query_states,
             key_states,
@@ -185,11 +154,6 @@ def patched_swa_attention_branch(profiler: SwaProfiler):
         )
         if isinstance(attn_output, (list, tuple)):
             attn_output = attn_output[0]
-
-        if profiler.enable:
-            end_event.record()
-            paddle.cuda.synchronize()
-            profiler.add_attn_time(start_event.elapsed_time(end_event))
 
         clear_sparse_ratio(module)
         attn_output = attn_output.reshape(
@@ -255,7 +219,7 @@ def set_patched_attention_config(
     return count
 
 
-def measure_forward(
+def measure_ttft(
     model,
     input_ids: paddle.Tensor,
     attention_mask: paddle.Tensor | None,
@@ -302,15 +266,9 @@ def slice_sample(
     return input_ids, attention_mask
 
 
-def summarize_times(
-    values: list[float],
-) -> tuple[float, float, float]:
+def summarize_mean(values: list[float]) -> float:
     array = np.asarray(values, dtype=np.float64)
-    return (
-        float(np.mean(array)),
-        float(np.median(array)),
-        float(np.min(array)),
-    )
+    return float(np.mean(array))
 
 
 @dataclass(frozen=True)
@@ -319,14 +277,6 @@ class Case:
     seq_len: int
     threshold: float | None = None
     window_size: int | None = None
-
-
-@dataclass
-class ProfileFns:
-    set_attn_time: Callable[[], None]
-    get_attn_time: Callable[[], float]
-    set_estimate_func_time: Callable[[], None]
-    get_estimate_func_time: Callable[[], float]
 
 
 def iter_cases(
@@ -348,7 +298,6 @@ def benchmark_case(
     model,
     samples: list[dict],
     case: Case,
-    profile_fns: ProfileFns,
     device: str,
     stride: int,
     warmup_iters: int,
@@ -364,9 +313,7 @@ def benchmark_case(
 
     for _ in range(warmup_iters):
         input_ids, attention_mask = slice_sample(samples[0], case.seq_len)
-        profile_fns.set_attn_time()
-        profile_fns.set_estimate_func_time()
-        measure_forward(
+        measure_ttft(
             model,
             input_ids,
             attention_mask,
@@ -375,40 +322,27 @@ def benchmark_case(
         )
         clear_cache(device)
 
-    forward_times = []
-    attn_times = []
-    estimate_times = []
+    ttft_times = []
     for sample in samples:
         input_ids, attention_mask = slice_sample(sample, case.seq_len)
-        profile_fns.set_attn_time()
-        profile_fns.set_estimate_func_time()
-        elapsed_ms = measure_forward(
+        elapsed_ms = measure_ttft(
             model,
             input_ids,
             attention_mask,
             device,
             attn_mask_startend_row_indices=startend_row_indices,
         )
-        forward_times.append(elapsed_ms)
-        attn_times.append(float(profile_fns.get_attn_time()))
-        estimate_times.append(float(profile_fns.get_estimate_func_time()))
+        ttft_times.append(elapsed_ms)
         clear_cache(device)
 
-    forward_mean, forward_median, forward_min = summarize_times(forward_times)
-    attn_mean, _, _ = summarize_times(attn_times)
-    estimate_mean, _, _ = summarize_times(estimate_times)
+    ttft_mean = summarize_mean(ttft_times)
     return {
         "method": case.method,
         "seq_len": case.seq_len,
         "threshold": "" if case.threshold is None else case.threshold,
         "window_size": "" if case.window_size is None else case.window_size,
         "stride": stride if case.method == "rrattn" else "",
-        "forward_mean_ms": forward_mean,
-        "forward_median_ms": forward_median,
-        "forward_min_ms": forward_min,
-        "attn_mean_ms": attn_mean,
-        "estimate_mean_ms": estimate_mean,
-        "operator_mean_ms": attn_mean + estimate_mean,
+        "ttft_mean_ms": ttft_mean,
     }
 
 
@@ -445,15 +379,11 @@ def print_case_result(row: dict):
     )
     print(
         "{method:<6} seq_len={seq_len:<6} {config:<16} "
-        "forward={forward:.2f}ms operator={operator:.2f}ms "
-        "attn={attn:.2f}ms estimate={estimate:.2f}ms".format(
+        "ttft_mean={ttft:.2f}ms".format(
             method=row["method"],
             seq_len=row["seq_len"],
             config=config,
-            forward=row["forward_mean_ms"],
-            operator=row["operator_mean_ms"],
-            attn=row["attn_mean_ms"],
-            estimate=row["estimate_mean_ms"],
+            ttft=row["ttft_mean_ms"],
         )
     )
 
@@ -470,6 +400,20 @@ def warn_if_non_hopper(device: str):
             "warning: FA v3 benchmark is intended for Hopper GPUs; "
             f"current capability is {major}.{minor}."
         )
+
+
+def patch_paddle_compat_for_paddlefleet_import():
+    compat = getattr(paddle, "compat", None)
+    if compat is None:
+        return
+    if callable(getattr(compat, "enable_torch_proxy", None)):
+        return
+
+    enable_compat = getattr(paddle, "enable_compat", None)
+    if callable(enable_compat):
+        compat.enable_torch_proxy = enable_compat
+    else:
+        compat.enable_torch_proxy = lambda *args, **kwargs: None
 
 
 def dry_run(
@@ -543,26 +487,7 @@ def main(
         model_type = infer_model_type(model_name)
 
     warn_if_non_hopper(device)
-    enable_profile = device.startswith("gpu")
-    (
-        rr_set_attn_time,
-        rr_get_attn_time,
-        rr_set_estimate_time,
-        rr_get_estimate_time,
-    ) = load_profile_fns("rrattn", enable_profile)
-    rr_profile_fns = ProfileFns(
-        set_attn_time=rr_set_attn_time,
-        get_attn_time=rr_get_attn_time,
-        set_estimate_func_time=rr_set_estimate_time,
-        get_estimate_func_time=rr_get_estimate_time,
-    )
-    swa_profiler = SwaProfiler(enable_profile)
-    swa_profile_fns = ProfileFns(
-        set_attn_time=swa_profiler.reset,
-        get_attn_time=swa_profiler.get_attn_time,
-        set_estimate_func_time=lambda: None,
-        get_estimate_func_time=swa_profiler.get_estimate_func_time,
-    )
+    patch_paddle_compat_for_paddlefleet_import()
 
     model = load_model(model_name, model_type, dtype)
     model.eval()
@@ -594,7 +519,7 @@ def main(
     print(f"cases={len(cases)} n_times={n_times} warmup_iters={warmup_iters}")
 
     rows = []
-    with patched_swa_attention_branch(swa_profiler):
+    with patched_swa_attention_branch():
         for case in cases:
             if case.method == "rrattn":
                 set_patched_attention_config(
@@ -603,16 +528,13 @@ def main(
                     threshold=case.threshold,
                     stride=stride,
                 )
-                profile_fns = rr_profile_fns
             else:
                 set_patched_attention_config(model, method="swa")
-                profile_fns = swa_profile_fns
 
             row = benchmark_case(
                 model,
                 samples,
                 case,
-                profile_fns,
                 device,
                 stride,
                 warmup_iters,
