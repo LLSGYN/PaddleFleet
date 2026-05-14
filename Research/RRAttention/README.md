@@ -95,6 +95,37 @@ model = patch_llama_attention(
 )
 ```
 
+### Torch Python API
+
+Torch entrypoints are exposed from `rrattn.modules_torch`:
+
+```python
+from rrattn.modules_torch import patch_llama_attention, rrattn_prefill
+
+attn_output, sparse_ratio = rrattn_prefill(
+    query_states,
+    key_states,
+    value_states,
+    threshold=0.95,
+    stride=8,
+    block_size=128,
+    use_triton=True,
+)
+
+model = patch_llama_attention(
+    model,
+    method="rrattn",
+    threshold=0.95,
+    stride=8,
+    use_triton=True,
+    keep_sink=True,
+    keep_recent=True,
+)
+```
+
+Torch patch entrypoints include `patch_llama_attention`,
+`patch_qwen_attention`, and `patch_ernie_attention`.
+
 ### Run HELMET Evaluation
 
 The release script runs the default HELMET sweep for `rrattn` and full attention on the short configs and the 128k configs. Set `model_name_or_paths` to one or more local checkpoint paths before running it:
@@ -125,9 +156,30 @@ python eval.py \
   --tag rrattn_0.95
 ```
 
+For the Torch backend, use the Torch environment and pass
+`--backend torch`. This path runs Hugging Face Transformers in-process and does
+not start a Paddle worker. RRAttention can be launched with:
+
+```bash
+source .venv_torch/bin/activate
+cd eval/HELMET
+PYTHONPATH=../.. python eval.py \
+  --backend torch \
+  --model_name_or_path /path/to/local-hf-checkpoint \
+  --data_root_dir . \
+  --qa_model_name_or_path ./models/roberta-large-squad \
+  --autoais_model_name_or_path ./models/t5_xxl_true_nli_mixture \
+  --config configs/recall_short.yaml \
+  --method rrattn \
+  --threshold 0.95 \
+  --stride 8 \
+  --rrattn_version v1 \
+  --tag torch_rrattn_0.95
+```
+
 ### Run Speed Test
 
-`scripts/speed_test.py` benchmarks the model prefill path on synthetic key-value retrieval prompts and records total, attention, and estimate time.
+`scripts/speed_test.py` benchmarks the Paddle model prefill path on synthetic key-value retrieval prompts and records total, attention, and estimate time.
 
 ```bash
 python scripts/speed_test.py \

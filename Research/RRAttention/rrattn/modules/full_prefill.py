@@ -129,7 +129,7 @@ def flash_full_prefill(
         key_states,
         value_states,
         startend_row_indices=None,
-        causal=True,
+        causal=causal,
     )
     if is_enable_profile():
         paddle.cuda.synchronize()

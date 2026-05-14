@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 from transformers.cache_utils import Cache
-from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+from transformers.models.ernie4_5 import modeling_ernie4_5
+from transformers.models.ernie4_5.modeling_ernie4_5 import apply_rotary_pos_emb
+from transformers.models.ernie4_5_moe import modeling_ernie4_5_moe
 
 from .patch_utils import (
     attention_forward,
@@ -23,19 +24,11 @@ from .patch_utils import (
 )
 
 
-def get_qwen_attention_classes():
-    from transformers.models.qwen2 import modeling_qwen2
-
-    classes = []
-    for name in (
-        "Qwen2Attention",
-        "Qwen2FlashAttention2",
-        "Qwen2SdpaAttention",
-    ):
-        cls = getattr(modeling_qwen2, name, None)
-        if cls is not None:
-            classes.append(cls)
-    return tuple(classes)
+def get_ernie_attention_classes():
+    return (
+        modeling_ernie4_5.Ernie4_5Attention,
+        modeling_ernie4_5_moe.Ernie4_5_MoeAttention,
+    )
 
 
 @torch.no_grad()
@@ -66,7 +59,7 @@ def new_attention_forward(
     )
 
 
-def patch_qwen_attention(
+def patch_ernie_attention(
     model,
     method: str = "rrattn",
     threshold: float = 0.9,
@@ -75,7 +68,7 @@ def patch_qwen_attention(
 ):
     return patch_attention_layers(
         model,
-        get_qwen_attention_classes(),
+        get_ernie_attention_classes(),
         new_attention_forward,
         method=method,
         threshold=threshold,
@@ -84,4 +77,4 @@ def patch_qwen_attention(
     )
 
 
-__all__ = ["patch_qwen_attention", "new_attention_forward"]
+__all__ = ["patch_ernie_attention", "new_attention_forward"]

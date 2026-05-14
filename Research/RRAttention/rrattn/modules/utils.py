@@ -26,6 +26,8 @@ def find_blocks_chunked(
 ):
     assert threshold is None or num_to_choose is None
     batch_size, head_num, chunk_num, block_num = input_tensor.shape
+    if block_num <= 1:
+        return paddle.ones_like(input_tensor, dtype=paddle.bool)
     if mode == "prefill" and decoding:
         return paddle.ones_like(input_tensor, dtype=paddle.bool)
     if mode == "decode" and not decoding:

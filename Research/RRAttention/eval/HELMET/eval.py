@@ -133,7 +133,6 @@ def run_test(args, model, dataset, test_file, demo_file):
             record_ttft_ms=args.record_ttft_ms,
             record_e2e_ms=args.record_e2e_ms,
             record_attn_ms=args.record_attn_ms,
-            method=args.method,
         )
     end_time = time.time()
 
@@ -497,9 +496,11 @@ def main():
 
     os.environ["NCCL_BLOCKING_WAIT"] = "0"  # not to enforce timeout
 
-    # Parent HELMET process keeps torch/HF data and judge flow. Use gloo by
-    # default so the tested model owns the CUDA context inside the Paddle worker.
-    parent_backend = os.environ.get("HELMET_PARENT_DIST_BACKEND", "gloo")
+    # Torch backend owns the CUDA model in this process, so bind ranks with
+    # NCCL. Paddle backend keeps CUDA work inside the isolated worker.
+    parent_backend = os.environ.get("HELMET_PARENT_DIST_BACKEND")
+    if parent_backend is None:
+        parent_backend = "nccl" if args.backend == "torch" else "gloo"
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29501")
     os.environ.setdefault("RANK", "0")
@@ -536,6 +537,10 @@ def main():
 
     if getattr(model, "uses_paddle_worker", False):
         logger.info(f"[Rank {rank}] Paddle worker handles attention patching")
+    elif getattr(model, "uses_torch_rrattn", False):
+        logger.info(
+            f"[Rank {rank}] Torch rrattn.modules_torch handles attention patching"
+        )
     elif args.method != "full":
         raise RuntimeError(
             "Legacy Torch sparse attention patching is not included in this release. "

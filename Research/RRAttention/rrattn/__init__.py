@@ -41,6 +41,15 @@ def __getattr__(name):
     from importlib import import_module
 
     module_name, attr_name = _EXPORTS[name]
-    value = getattr(import_module(module_name), attr_name)
+    try:
+        value = getattr(import_module(module_name), attr_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == "paddle":
+            raise ModuleNotFoundError(
+                "The top-level rrattn API is Paddle-only and requires "
+                "PaddlePaddle. Torch users should import from "
+                "rrattn.modules_torch."
+            ) from exc
+        raise
     globals()[name] = value
     return value

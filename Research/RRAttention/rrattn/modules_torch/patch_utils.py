@@ -63,9 +63,19 @@ def configure_attention_layer(
 
 
 def bind_attention_forward(attn, new_forward):
-    if not hasattr(attn, "_rrattn_original_forward"):
-        attn._rrattn_original_forward = attn.forward
     attn.forward = types.MethodType(new_forward, attn)
+
+
+def get_num_heads(module) -> int:
+    if hasattr(module, "num_heads"):
+        return module.num_heads
+    return module.config.num_attention_heads
+
+
+def get_num_key_value_heads(module) -> int:
+    if hasattr(module, "num_key_value_heads"):
+        return module.num_key_value_heads
+    return module.config.num_key_value_heads
 
 
 def patch_attention_layers(
@@ -178,6 +188,7 @@ def prefill_attention(
             keep_recent=getattr(module, "keep_recent", True),
             chunk_size=getattr(module, "chunk_size", 16384),
             layer_idx=getattr(module, "layer_idx", None),
+            config=getattr(module, "rrattn_config", None),
         )
         module.sparse_ratio = sparse_ratio
         return attn_output.transpose(1, 2)
@@ -251,7 +262,6 @@ def attention_forward(
     module,
     hidden_states: torch.Tensor,
     apply_rotary_pos_emb,
-    repeat_kv,
     attention_mask=None,
     position_ids=None,
     past_key_value=None,
@@ -267,14 +277,17 @@ def attention_forward(
     key_states = module.k_proj(hidden_states)
     value_states = module.v_proj(hidden_states)
 
+    num_heads = get_num_heads(module)
+    num_key_value_heads = get_num_key_value_heads(module)
+
     query_states = query_states.view(
-        bsz, q_len, module.num_heads, module.head_dim
+        bsz, q_len, num_heads, module.head_dim
     ).transpose(1, 2)
     key_states = key_states.view(
-        bsz, q_len, module.num_key_value_heads, module.head_dim
+        bsz, q_len, num_key_value_heads, module.head_dim
     ).transpose(1, 2)
     value_states = value_states.view(
-        bsz, q_len, module.num_key_value_heads, module.head_dim
+        bsz, q_len, num_key_value_heads, module.head_dim
     ).transpose(1, 2)
 
     if position_embeddings is None:
@@ -294,9 +307,6 @@ def attention_forward(
         key_states, value_states = past_key_value.update(
             key_states, value_states, module.layer_idx, cache_kwargs
         )
-
-    key_states = repeat_kv(key_states, module.num_key_value_groups)
-    value_states = repeat_kv(value_states, module.num_key_value_groups)
 
     input_dtype = query_states.dtype
     if input_dtype == torch.float32:
@@ -325,10 +335,8 @@ def attention_forward(
             module, query_states, key_states, value_states, attention_mask
         )
 
-    hidden_size = getattr(
-        module, "hidden_size", module.num_heads * module.head_dim
-    )
+    hidden_size = getattr(module, "hidden_size", num_heads * module.head_dim)
     attn_output = attn_output.reshape(bsz, q_len, hidden_size).contiguous()
     attn_output = module.o_proj(attn_output)
     attn_weights = None if not output_attentions else None
-    return attn_output, attn_weights, past_key_value
+    return attn_output, attn_weights

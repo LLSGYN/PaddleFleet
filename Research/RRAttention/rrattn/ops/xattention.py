@@ -28,7 +28,7 @@ def softmax_fuse_block_sum_kernel_causal(
     output_stride_1,
     output_stride_2,
     real_q_len,
-    k_len,  # we assume k_len is divisible by chunk size
+    k_len,
     chunk_start,
     chunk_end,
     segment_size: tl.constexpr,
@@ -78,7 +78,6 @@ def softmax_fuse_block_sum_kernel_causal(
         X = X - m_new[:, None]
         l_local = tl.sum(tl.math.exp2(X), 1)
         l_i = l_i * alpha + l_local
-
         m_i = m_new
 
     for iter in range(num_iters_before_causal, num_iters_before_causal + 1):
@@ -92,17 +91,15 @@ def softmax_fuse_block_sum_kernel_causal(
         X = X - m_new[:, None]
         l_local = tl.sum(tl.math.exp2(X), 1)
         l_i = l_i * alpha + l_local
-
         m_i = m_new
 
     l_i_inv = 1.0 / l_i
-
-    sum_mask = offs_q[:, None] < real_q_len
+    q_valid = offs_q[:, None] < real_q_len
 
     for iter in range(0, num_iters_before_causal):
         X = tl.load(input_ptr + iter * segment_size).to(tl.float32) * scale
         X = tl.exp2(X - m_i[:, None]) * l_i_inv[:, None]
-        X = tl.where(sum_mask, X, 0)
+        X = tl.where(q_valid, X, 0)
         X = tl.reshape(X, (block_size, segment_size // block_size, block_size))
         X = tl.sum(X, 2)
         X = tl.sum(X, 0)
@@ -116,7 +113,7 @@ def softmax_fuse_block_sum_kernel_causal(
         mask = offs_q[:, None] >= (offs_k[None, :] + iter * segment_size)
         X = tl.where(mask, X, -1.0e6)
         X = tl.exp2(X - m_i[:, None]) * l_i_inv[:, None]
-        X = tl.where(sum_mask, X, 0)
+        X = tl.where(q_valid, X, 0)
         X = tl.reshape(X, (block_size, segment_size // block_size, block_size))
         X = tl.sum(X, 2)
         X = tl.sum(X, 0)
@@ -145,7 +142,7 @@ def softmax_fuse_block_sum_kernel_non_causal(
     output_stride_1,
     output_stride_2,
     real_q_len,
-    k_len,  # we assume k_len is divisible by chunk size
+    k_len,
     chunk_start,
     chunk_end,
     segment_size: tl.constexpr,
@@ -157,7 +154,6 @@ def softmax_fuse_block_sum_kernel_non_causal(
 
     offs_q = tl.arange(0, block_size) + chunk_start + block_id * block_size
     offs_k = tl.arange(0, segment_size)
-
     num_iters = k_len // segment_size
 
     m_i = tl.zeros([block_size], dtype=tl.float32) - float("inf")
@@ -192,17 +188,15 @@ def softmax_fuse_block_sum_kernel_non_causal(
         X = X - m_new[:, None]
         l_local = tl.sum(tl.math.exp2(X), 1)
         l_i = l_i * alpha + l_local
-
         m_i = m_new
 
     l_i_inv = 1.0 / l_i
-
-    sum_mask = offs_q[:, None] < real_q_len
+    q_valid = offs_q[:, None] < real_q_len
 
     for iter in range(0, num_iters):
         X = tl.load(input_ptr + iter * segment_size).to(tl.float32) * scale
         X = tl.exp2(X - m_i[:, None]) * l_i_inv[:, None]
-        X = tl.where(sum_mask, X, 0)
+        X = tl.where(q_valid, X, 0)
         X = tl.reshape(X, (block_size, segment_size // block_size, block_size))
         X = tl.sum(X, 2)
         X = tl.sum(X, 0)
@@ -270,7 +264,6 @@ def flat_group_gemm_fuse_reshape_kernel(
     )
 
     o = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
     for iter in range(STRIDE):
         q = tl.load(Q_ptrs - iter * stride_qn)
         k = tl.load(K_ptrs + iter * stride_kn)
@@ -288,7 +281,6 @@ def flat_group_gemm_fuse_reshape_kernel(
         + tl.arange(0, BLOCK_M)[:, None] * stride_on
         + tl.arange(0, BLOCK_N)[None, :]
     )
-
     tl.store(O_ptrs, o.to(Out.type.element_ty))
 
 

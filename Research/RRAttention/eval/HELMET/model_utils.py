@@ -1001,6 +1001,70 @@ def tokenize(
     return tokenized_input
 
 
+def _get_torch_prefill_profile_module(method: str):
+    if method == "xattn":
+        import rrattn.modules_torch.xattention as prefill_mod
+    elif method == "rrattn":
+        import rrattn.modules_torch.rrattention as prefill_mod
+    elif method == "flex":
+        import rrattn.modules_torch.flexprefill as prefill_mod
+    else:
+        import rrattn.modules_torch.full_prefill as prefill_mod
+
+    return prefill_mod
+
+
+def _patch_torch_attention_model(
+    model,
+    model_name: str,
+    method: str,
+    threshold: float,
+    stride: int,
+) -> bool:
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", "")
+    architectures = " ".join(getattr(config, "architectures", []) or [])
+    family_hint = f"{model_name} {model_type} {architectures}".lower()
+    if "qwen" in family_hint:
+        from rrattn.modules_torch import patch_qwen_attention
+
+        patch_qwen_attention(
+            model,
+            method=method,
+            threshold=threshold,
+            stride=stride,
+        )
+    elif "llama" in family_hint:
+        from rrattn.modules_torch import patch_llama_attention
+
+        patch_llama_attention(
+            model,
+            method=method,
+            threshold=threshold,
+            stride=stride,
+        )
+    elif "ernie" in family_hint:
+        from rrattn.modules_torch import patch_ernie_attention
+
+        patch_ernie_attention(
+            model,
+            method=method,
+            threshold=threshold,
+            stride=stride,
+        )
+    else:
+        raise ValueError(
+            "Torch HELMET backend currently supports Llama, Qwen2/Qwen2.5, "
+            f"and ERNIE 4.5 attention patching, got model_name={model_name!r}"
+        )
+
+    logger.info(
+        "Patched Torch attention with rrattn.modules_torch "
+        f"method={method} threshold={threshold} stride={stride}"
+    )
+    return True
+
+
 class HFModel(LLM):
     def __init__(
         self,
@@ -1035,7 +1099,7 @@ class HFModel(LLM):
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         model_kwargs = {}
-        from pkg_resources import parse_version
+        from packaging.version import parse as parse_version
 
         if parse_version(transformers.__version__) <= parse_version("4.34.1"):
             model_kwargs["use_flash_attention_2"] = True
@@ -1072,6 +1136,14 @@ class HFModel(LLM):
             trust_remote_code=True,
             **model_kwargs,
         ).to("cuda")
+        self.method = kwargs.get("method", "full")
+        self.uses_torch_rrattn = _patch_torch_attention_model(
+            self.model,
+            model_name=model_name,
+            method=self.method,
+            threshold=kwargs.get("threshold", 0.95),
+            stride=kwargs.get("stride", 8),
+        )
         if kwargs.get("torch_compile", True):
             self.model = torch.compile(self.model)
             # https://huggingface.co/docs/transformers/en/llm_optims?static-kv=basic+usage%3A+generation_config#static-kv-cache-and-torchcompile
@@ -1149,6 +1221,9 @@ class HFModel(LLM):
         record_ttft_ms = kwargs.get("record_ttft_ms", False)
         record_e2e_ms = kwargs.get("record_e2e_ms", False)
         record_attn_ms = kwargs.get("record_attn_ms", False)
+        ttft_elapsed_time_ms = 0.0
+        attn_ms = 0.0
+        estimate_func_ms = 0.0
 
         if record_e2e_ms:
             torch.cuda.synchronize()
@@ -1175,25 +1250,14 @@ class HFModel(LLM):
                 )
                 extra = {"past_key_values": cache}
 
-            if record_ttft_ms:
-                if record_attn_ms:
-                    method = kwargs.get("method", "full")
-                    if method == "xattn":
-                        import rrattn.modules.xattention as prefill_mod
-                    elif method == "rrattn":
-                        import rrattn.modules.rrattention as prefill_mod
-                    elif method == "flex":
-                        import rrattn.modules.flexprefill as prefill_mod
-                    else:
-                        import rrattn.modules.full_prefill as prefill_mod
-
-                    reset_estimate_time = prefill_mod.set_estimate_func_time
-                    get_estimate_time = prefill_mod.get_estimate_func_time
-
-                torch.cuda.synchronize()
+            if record_attn_ms:
+                prefill_mod = _get_torch_prefill_profile_module(self.method)
                 prefill_mod.set_profile(True)
                 prefill_mod.set_attn_time()
-                reset_estimate_time()
+                prefill_mod.set_estimate_func_time()
+
+            if record_ttft_ms:
+                torch.cuda.synchronize()
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
@@ -1210,9 +1274,9 @@ class HFModel(LLM):
                 torch.cuda.synchronize()
                 ttft_elapsed_time_ms = start_event.elapsed_time(end_event)
 
-                if record_attn_ms:
-                    attn_ms = prefill_mod.get_attn_time()
-                    estimate_func_ms = get_estimate_time()
+            if record_attn_ms:
+                attn_ms = prefill_mod.get_attn_time()
+                estimate_func_ms = prefill_mod.get_estimate_func_time()
 
             past_key_values = prefill.past_key_values
             if past_key_values is None:
@@ -1634,7 +1698,6 @@ class PaddleWorkerModel(LLM):
             "record_ttft_ms": kwargs.get("record_ttft_ms", False),
             "record_e2e_ms": kwargs.get("record_e2e_ms", False),
             "record_attn_ms": kwargs.get("record_attn_ms", False),
-            "method": kwargs.get("method", self.method),
         }
         response = self._worker_request(payload)
         output_ids = response["output_ids"]
@@ -2037,6 +2100,7 @@ class SGLangModel(LLM):
 
 def load_LLM(args):
     kwargs = {}
+    backend = getattr(args, "backend", "paddle")
     if "gpt" in args.model_name_or_path:
         model_cls = OpenAIModel
         kwargs["seed"] = args.seed
@@ -2057,6 +2121,17 @@ def load_LLM(args):
     elif args.use_sglang:
         model_cls = SGLangModel
         kwargs["seed"] = args.seed
+    elif backend == "torch":
+        model_cls = HFModel
+        kwargs["seed"] = args.seed
+        kwargs["method"] = args.method
+        kwargs["threshold"] = args.threshold
+        kwargs["stride"] = args.stride
+        kwargs["torch_compile"] = not args.no_torch_compile
+        if args.no_bf16:
+            kwargs["torch_dtype"] = torch.float32
+        if args.rope_theta is not None:
+            kwargs["rope_theta"] = args.rope_theta
     else:
         model_cls = PaddleWorkerModel
         kwargs["seed"] = args.seed

@@ -20,13 +20,14 @@ from dataclasses import dataclass
 import paddle
 import paddle.nn.functional as F
 import triton
-import triton.language as tl
 from paddle import use_compat_guard
 
 from rrattn.ops.rrattention import (
     rrattn_flashmask_softmax_reduce_qchunk_kernel,
     rrattn_gemm_qchunk_gqa_kernel,
     rrattn_nomask_softmax_reduce_kernel,
+    scan_maxmin_chunked,
+    top_p_kernel,
 )
 
 
@@ -160,46 +161,6 @@ def _normalize_config(
     return get_rrattn_config(head_dim)
 
 
-@triton.jit
-def scan_maxmin_chunked(
-    input_ptr,
-    output_max_ptr,
-    output_min_ptr,
-    seqlen,
-    num_chunks,
-    chunk_size: tl.constexpr,
-    BN: tl.constexpr,
-):
-    INT_MAX: tl.constexpr = 2147483647
-    INT_MIN: tl.constexpr = -2147483648
-
-    i_tile = tl.program_id(0)
-    i_bh = tl.program_id(1)
-
-    p_tile = i_tile * BN + tl.arange(0, BN)
-    mask_tile = p_tile < seqlen
-    b_tile = tl.load(input_ptr + i_bh * seqlen + p_tile, mask=mask_tile)
-
-    b_omax = tl.where(mask_tile, b_tile, INT_MIN).reshape(
-        (BN // chunk_size, chunk_size)
-    )
-    b_omax = tl.max(b_omax, axis=1)
-
-    b_omin = tl.where(mask_tile, b_tile, INT_MAX).reshape(
-        (BN // chunk_size, chunk_size)
-    )
-    b_omin = tl.min(b_omin, axis=1)
-
-    offs_out = tl.arange(0, BN // chunk_size) + i_tile * (BN // chunk_size)
-    mask_out = offs_out < num_chunks
-    tl.store(
-        output_max_ptr + i_bh * num_chunks + offs_out, b_omax, mask=mask_out
-    )
-    tl.store(
-        output_min_ptr + i_bh * num_chunks + offs_out, b_omin, mask=mask_out
-    )
-
-
 def prepare_maxmin(
     input_tensor: paddle.Tensor,
     chunk_size: int,
@@ -230,119 +191,6 @@ def prepare_maxmin(
         BN=bn,
     )
     return output_max, output_min
-
-
-@triton.jit
-def _compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    shape: tl.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
-    y = tl.reshape(x, shape)
-
-    mask = tl.arange(0, 2)[None, :, None]
-    left = tl.broadcast_to(
-        tl.sum(tl.where(mask == 0, y, 0), 1)[:, None, :], shape
-    ).to(y.dtype)
-    right = tl.broadcast_to(
-        tl.sum(tl.where(mask == 1, y, 0), 1)[:, None, :], shape
-    ).to(y.dtype)
-    left = tl.reshape(left, x.shape)
-    right = tl.reshape(right, x.shape)
-
-    y_idx = tl.reshape(ids, shape)
-    left_idx = tl.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape)
-    right_idx = tl.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape)
-    left_idx = tl.reshape(left_idx, x.shape).to(y_idx.dtype)
-    right_idx = tl.reshape(right_idx, x.shape).to(y_idx.dtype)
-
-    idtype = tl.core.get_int_dtype(
-        bitwidth=x.dtype.primitive_bitwidth, signed=True
-    )
-    ileft = left.to(idtype, bitcast=True)
-    iright = right.to(idtype, bitcast=True)
-    ix = x.to(idtype, bitcast=True)
-
-    cond = (left > right) != flip
-    ret = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
-    new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
-    return ret.to(x.dtype, bitcast=True), new_ids
-
-
-@triton.jit
-def _bitonic_merge(
-    x, ids, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr
-):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    tl.static_assert(stage <= n_dims)
-
-    if order == 2:
-        shape: tl.constexpr = [n_outer * 2 ** (n_dims - 1 - stage), 2, 2**stage]
-        flip = tl.reshape(
-            tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape
-        )
-    else:
-        flip = order
-
-    for i in tl.static_range(stage):
-        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
-    return x, ids
-
-
-@triton.jit
-def bitonic_argsort_device(
-    x, ids, n_dims: tl.constexpr, descending: tl.constexpr = tl.core.CONSTEXPR_0
-):
-    for i in tl.static_range(1, n_dims + 1):
-        x, ids = _bitonic_merge(
-            x, ids, i, 2 if i < n_dims else descending, n_dims
-        )
-    return x, ids
-
-
-@triton.jit
-def top_p_kernel(
-    X_ptr,
-    Out_ptr,
-    stride_row,
-    threshold_p,
-    N_COLS,
-    BLOCK_SIZE: tl.constexpr,
-    NUM_DIMS: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    row_start_ptr = X_ptr + pid * stride_row
-
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask_load = offsets < N_COLS
-
-    x_raw = tl.load(row_start_ptr + offsets, mask=mask_load, other=0.0).to(
-        tl.float32
-    )
-    row_sum = tl.sum(x_raw, axis=0)
-
-    out_row_ptr = Out_ptr + pid * stride_row
-    if row_sum == 0.0:
-        tl.store(
-            out_row_ptr + offsets,
-            tl.zeros([BLOCK_SIZE], dtype=tl.int8),
-            mask=mask_load,
-        )
-        return
-
-    actual_cutoff = row_sum * threshold_p
-    padding_val = float("-inf")
-    x_for_sort = tl.where(mask_load, x_raw, padding_val)
-    ids = tl.arange(0, BLOCK_SIZE)
-
-    x_sorted, ids_sorted = bitonic_argsort_device(
-        x_for_sort, ids, NUM_DIMS, descending=1
-    )
-
-    cum_probs = tl.cumsum(x_sorted, axis=0)
-    mask_keep = (cum_probs - x_sorted) < actual_cutoff
-    mask_keep = mask_keep & (x_sorted > padding_val)
-
-    mask_store = ids_sorted < N_COLS
-    tl.store(out_row_ptr + ids_sorted, mask_keep.to(tl.int8), mask=mask_store)
 
 
 def find_blocks_topp(x: paddle.Tensor, p: float) -> paddle.Tensor:

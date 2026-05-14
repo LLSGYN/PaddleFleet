@@ -52,6 +52,13 @@ def parse_arguments():
     # model setting
     parser.add_argument("--model_name_or_path", type=str, default=None)
     parser.add_argument(
+        "--backend",
+        type=str,
+        default="paddle",
+        choices=["paddle", "torch"],
+        help="local model backend: paddle uses an isolated Paddle worker; torch runs HF/Transformers in-process",
+    )
+    parser.add_argument(
         "--model_type",
         type=str,
         default="auto",

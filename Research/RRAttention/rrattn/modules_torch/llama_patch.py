@@ -15,12 +15,12 @@
 
 import torch
 from transformers.cache_utils import Cache
-from transformers.models.llama.modeling_llama import (
-    apply_rotary_pos_emb,
-    repeat_kv,
-)
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
-from .patch_utils import attention_forward, patch_attention_layers
+from .patch_utils import (
+    attention_forward,
+    patch_attention_layers,
+)
 
 
 def get_llama_attention_classes():
@@ -55,7 +55,6 @@ def new_attention_forward(
         self,
         hidden_states,
         apply_rotary_pos_emb,
-        repeat_kv,
         attention_mask=attention_mask,
         position_ids=position_ids,
         past_key_value=past_key_value,

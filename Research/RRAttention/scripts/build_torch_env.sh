@@ -16,15 +16,21 @@
 
 set -euo pipefail
 
-python -m pip install --pre paddlepaddle-gpu==3.5.0.dev20260512 \
-    -i https://www.paddlepaddle.org.cn/packages/nightly/cu129/
-python -m pip install paddleformers==1.1.1
-python -m pip install --pre paddlefleet-ops==0.3.0.dev20260513+7e1fa59b \
-    --extra-index-url https://www.paddlepaddle.org.cn/packages/nightly/cu129/
-python -m pip install -e ../..
+python -m pip install --upgrade pip setuptools wheel
 
-python -m pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu129
-python -m pip install triton ninja packaging einops
+python -m pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+    --index-url https://download.pytorch.org/whl/cu129
+
+python -m pip install transformers==4.54.1 accelerate sentencepiece
 python -m pip install -r eval/HELMET/requirements.txt
-python -m pip install tokenizers protobuf dill pyyaml nltk pandas tabulate tiktoken torchcodec pytest
+python -m pip install triton ninja packaging einops
+
+python -m pip install flash-attn==2.8.3 --no-build-isolation
+
+rm -rf .deps/Block-Sparse-Attention
+mkdir -p .deps
+git clone https://github.com/mit-han-lab/Block-Sparse-Attention.git .deps/Block-Sparse-Attention
+python -m pip install .deps/Block-Sparse-Attention --no-build-isolation
+rm -rf .deps/Block-Sparse-Attention
+
 python -m pip install -e .

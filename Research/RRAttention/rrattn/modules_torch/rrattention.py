@@ -13,15 +13,129 @@
 # limitations under the License.
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
-from .kernels import (
-    flat_group_gemm_fuse_reshape_rr,
-    softmax_fuse_block_sum,
+from rrattn.ops.rrattention import flat_group_gemm_fuse_reshape_rr_kernel
+from rrattn.ops.xattention import (
+    softmax_fuse_block_sum_kernel_causal,
+    softmax_fuse_block_sum_kernel_non_causal,
 )
+
 from .utils import find_blocks_chunked
+
+
+@dataclass(frozen=True)
+class RRAttnConfig:
+    # Keep this in sync with rrattn.modules.rrattention.RRAttnConfig.
+    block_m: int = 128
+    block_n: int = 32
+    num_warps: int = 4
+    num_stages: int = 1
+    segment_size: int = 128
+
+
+TUNABLE_FIELDS = (
+    "block_m",
+    "block_n",
+    "num_warps",
+    "num_stages",
+    "segment_size",
+)
+
+
+def gpu_info() -> tuple[str, int | None]:
+    if not torch.cuda.is_available():
+        return "", None
+    try:
+        device = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device)
+        return props.name.lower(), props.major
+    except Exception:
+        return "", None
+
+
+GPU_NAME, GPU_MAJOR = gpu_info()
+
+
+def get_rrattn_config(
+    head_dim: int, gpu_name: str | None = None
+) -> RRAttnConfig:
+    gpu_name = (gpu_name or GPU_NAME or "").lower()
+
+    if "h100" in gpu_name or "h800" in gpu_name:
+        if head_dim <= 64:
+            return RRAttnConfig(
+                block_m=128,
+                block_n=64,
+                num_warps=4,
+                num_stages=1,
+                segment_size=256,
+            )
+        elif head_dim <= 128:
+            return RRAttnConfig(
+                block_m=128,
+                block_n=64,
+                num_warps=4,
+                num_stages=3,
+                segment_size=256,
+            )
+        else:
+            return RRAttnConfig(
+                block_m=128,
+                block_n=64,
+                num_warps=8,
+                num_stages=1,
+                segment_size=256,
+            )
+
+    if head_dim <= 64:
+        return RRAttnConfig(
+            block_m=128, block_n=16, num_warps=4, num_stages=1, segment_size=256
+        )
+    elif head_dim <= 128:
+        return RRAttnConfig(
+            block_m=128, block_n=32, num_warps=4, num_stages=2, segment_size=256
+        )
+    else:
+        return RRAttnConfig(num_warps=4, num_stages=1)
+
+
+def _normalize_config(
+    config: RRAttnConfig | None, *, head_dim: int
+) -> RRAttnConfig:
+    if config is not None:
+        return config
+    return get_rrattn_config(head_dim)
+
+
+def _resolve_segment_size(
+    config_segment_size: int, reshaped_block_size: int, k_reshaped_seq_len: int
+) -> int:
+    segment_size = int(config_segment_size)
+    while (
+        segment_size > k_reshaped_seq_len and segment_size > reshaped_block_size
+    ):
+        segment_size //= 2
+
+    if (
+        segment_size >= reshaped_block_size
+        and segment_size % reshaped_block_size == 0
+        and k_reshaped_seq_len % segment_size == 0
+    ):
+        return segment_size
+
+    max_segment_size = (
+        min(segment_size, k_reshaped_seq_len) // reshaped_block_size
+    ) * reshaped_block_size
+    for candidate in range(
+        max_segment_size, reshaped_block_size - 1, -reshaped_block_size
+    ):
+        if k_reshaped_seq_len % candidate == 0:
+            return candidate
+    return reshaped_block_size
 
 
 def _block_sparse_attn_func(*args, **kwargs):
@@ -75,6 +189,144 @@ def add_estimate_func_time(xattn_estimate_func_time):
     estimate_func_time_ms += xattn_estimate_func_time
 
 
+def softmax_fuse_block_sum(
+    attn_weights_slice,
+    reshaped_block_size,
+    segment_size,
+    chunk_start,
+    chunk_end,
+    real_q_len,
+    scale,
+    is_causal=True,
+):
+    batch_size, num_heads, q_len, k_len = attn_weights_slice.shape
+    assert q_len % reshaped_block_size == 0
+    assert k_len % segment_size == 0
+    assert segment_size % reshaped_block_size == 0
+    assert attn_weights_slice.stride(-1) == 1
+
+    output = torch.empty(
+        (
+            batch_size,
+            num_heads,
+            q_len // reshaped_block_size,
+            k_len // reshaped_block_size,
+        ),
+        dtype=attn_weights_slice.dtype,
+        device=attn_weights_slice.device,
+    )
+
+    grid = (q_len // reshaped_block_size, num_heads, batch_size)
+    if is_causal:
+        softmax_fuse_block_sum_kernel_causal[grid](
+            attn_weights_slice,
+            output,
+            scale,
+            attn_weights_slice.stride(0),
+            attn_weights_slice.stride(1),
+            attn_weights_slice.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            real_q_len,
+            k_len,
+            chunk_start,
+            chunk_end,
+            segment_size,
+            reshaped_block_size,
+        )
+    else:
+        softmax_fuse_block_sum_kernel_non_causal[grid](
+            attn_weights_slice,
+            output,
+            scale,
+            attn_weights_slice.stride(0),
+            attn_weights_slice.stride(1),
+            attn_weights_slice.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            real_q_len,
+            k_len,
+            chunk_start,
+            chunk_end,
+            segment_size,
+            reshaped_block_size,
+        )
+
+    return output
+
+
+def flat_group_gemm_fuse_reshape_rr(
+    query_states,
+    key_states,
+    stride,
+    chunk_start,
+    chunk_end,
+    is_causal=True,
+    block_m=128,
+    block_n=128,
+    num_warps=None,
+    num_stages=None,
+):
+    batch_size, num_heads, q_len, head_dim = query_states.shape
+    kv_len = key_states.shape[2]
+
+    assert key_states.shape[0] == batch_size
+    assert num_heads % key_states.shape[1] == 0
+    assert key_states.shape[3] == head_dim
+    gqa_groups = num_heads // key_states.shape[1]
+    if gqa_groups != 1:
+        key_states = key_states.repeat_interleave(gqa_groups, dim=1)
+
+    output = torch.empty(
+        (batch_size, num_heads, q_len // stride, kv_len // stride),
+        dtype=query_states.dtype,
+        device=query_states.device,
+    )
+    block_m = int(block_m)
+    block_n = int(block_n)
+    assert q_len % (stride * block_m) == 0
+    assert kv_len % (stride * block_n) == 0
+
+    grid = (
+        q_len // stride // block_m,
+        kv_len // stride // block_n,
+        batch_size * num_heads,
+    )
+    launch_kwargs = {}
+    if num_warps is not None:
+        launch_kwargs["num_warps"] = int(num_warps)
+    if num_stages is not None:
+        launch_kwargs["num_stages"] = int(num_stages)
+
+    flat_group_gemm_fuse_reshape_rr_kernel[grid](
+        query_states,
+        key_states,
+        output,
+        query_states.stride(0),
+        query_states.stride(1),
+        query_states.stride(2),
+        key_states.stride(0),
+        key_states.stride(1),
+        key_states.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        chunk_start,
+        chunk_end,
+        num_heads,
+        stride,
+        head_dim,
+        block_m,
+        block_n,
+        is_causal,
+        **launch_kwargs,
+    )
+
+    return output
+
+
 def rrattn_estimate(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -91,9 +343,11 @@ def rrattn_estimate(
     keep_sink=False,
     keep_recent=False,
     layer_idx=None,
+    config: RRAttnConfig | None = None,
 ) -> torch.Tensor:
     batch_size, num_q_head, q_len, head_dim = query_states.shape
     batch_size, num_kv_head, k_len, head_dim = key_states.shape
+    config = _normalize_config(config, head_dim=head_dim)
 
     # 1. 计算相关参数
     k_num_to_pad = ((k_len + chunk_size - 1) // chunk_size) * chunk_size - k_len
@@ -110,6 +364,9 @@ def rrattn_estimate(
     q_reshaped_num_to_pad = q_num_to_pad // stride
     num_blocks_per_chunk = reshaped_chunk_size // reshaped_block_size
     offset_token_chunk_num = k_chunk_num - q_chunk_num
+    segment_size = _resolve_segment_size(
+        config.segment_size, reshaped_block_size, k_reshaped_seq_len
+    )
 
     attn_sum_list = []
 
@@ -151,11 +408,15 @@ def rrattn_estimate(
             + chunk_idx * reshaped_chunk_size
             + reshaped_chunk_size,
             is_causal=causal,
+            block_m=config.block_m,
+            block_n=config.block_n,
+            num_warps=config.num_warps,
+            num_stages=config.num_stages,
         )
         attn_sum = softmax_fuse_block_sum(
             attn_weights_slice,
             reshaped_block_size,
-            min(4096, reshaped_block_size),
+            segment_size,
             (k_block_num - q_block_num) * reshaped_block_size
             + chunk_idx * reshaped_chunk_size,
             (k_block_num - q_block_num) * reshaped_block_size
@@ -221,9 +482,13 @@ def rrattn_prefill(
     keep_sink=False,
     keep_recent=False,
     layer_idx=None,
+    config: RRAttnConfig | None = None,
 ):
-    batch_size, num_heads, k_len, head_dim = key_states.shape
-    _, _, q_len, _ = query_states.shape
+    batch_size, num_kv_heads, k_len, head_dim = key_states.shape
+    _, num_q_heads, q_len, _ = query_states.shape
+    assert num_q_heads % num_kv_heads == 0, (
+        "MHA/GQA requires num_q_heads % num_kv_heads == 0"
+    )
 
     q_block_num = (q_len + block_size - 1) // block_size
     k_block_num = (k_len + block_size - 1) // block_size
@@ -266,6 +531,7 @@ def rrattn_prefill(
         keep_sink=keep_sink,
         keep_recent=keep_recent,
         layer_idx=layer_idx,
+        config=config,
     )
     if is_enable_profile():
         # torch.cuda.synchronize()
@@ -288,9 +554,13 @@ def rrattn_prefill(
     ####################
     assert block_size == 128
     assert batch_size == 1
-    query_states = query_states.transpose(1, 2).view(q_len, num_heads, head_dim)
-    key_states = key_states.transpose(1, 2).view(k_len, num_heads, head_dim)
-    value_states = value_states.transpose(1, 2).view(k_len, num_heads, head_dim)
+    query_states = query_states.transpose(1, 2).view(
+        q_len, num_q_heads, head_dim
+    )
+    key_states = key_states.transpose(1, 2).view(k_len, num_kv_heads, head_dim)
+    value_states = value_states.transpose(1, 2).view(
+        k_len, num_kv_heads, head_dim
+    )
     q_cu_seq_lens = torch.tensor(
         [0, q_len], dtype=torch.int32, device=query_states.device
     )
@@ -298,7 +568,7 @@ def rrattn_prefill(
         [0, k_len], dtype=torch.int32, device=query_states.device
     )
     head_mask_type = torch.tensor(
-        [1 for _ in range(num_heads)],
+        [1 for _ in range(num_q_heads)],
         device=query_states.device,
         dtype=torch.int32,
     )
@@ -330,7 +600,7 @@ def rrattn_prefill(
         is_causal=causal,
     )
     attn_output = attn_output.view(
-        batch_size, q_len, num_heads, head_dim
+        batch_size, q_len, num_q_heads, head_dim
     ).transpose(1, 2)
     if is_enable_profile():
         # torch.cuda.synchronize()
@@ -341,7 +611,7 @@ def rrattn_prefill(
     ################################
 
     del query_states
-    num_to_compute = (k_block_num + 1) * k_block_num / 2 * num_heads
+    num_to_compute = (k_block_num + 1) * k_block_num / 2 * num_q_heads
 
     # print(f"approximated prefilling Computation: {approx_simple_mask.sum() / num_to_compute}")
     sparse_ratio = 1.0 - (approx_simple_mask.sum() / num_to_compute)
@@ -350,6 +620,9 @@ def rrattn_prefill(
 
 
 __all__ = [
+    "RRAttnConfig",
+    "get_rrattn_config",
+    "rrattn_estimate",
     "rrattn_prefill",
     "set_profile",
     "is_enable_profile",

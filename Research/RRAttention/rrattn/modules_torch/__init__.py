@@ -21,6 +21,15 @@ _EXPORTS = {
     "flex_prefill": ("rrattn.modules_torch.flexprefill", "flex_prefill"),
     "xattn_prefill": ("rrattn.modules_torch.xattention", "xattn_prefill"),
     "rrattn_prefill": ("rrattn.modules_torch.rrattention", "rrattn_prefill"),
+    "rrattn_estimate": (
+        "rrattn.modules_torch.rrattention",
+        "rrattn_estimate",
+    ),
+    "RRAttnConfig": ("rrattn.modules_torch.rrattention", "RRAttnConfig"),
+    "get_rrattn_config": (
+        "rrattn.modules_torch.rrattention",
+        "get_rrattn_config",
+    ),
     "patch_llama_attention": (
         "rrattn.modules_torch.llama_patch",
         "patch_llama_attention",
@@ -28,6 +37,10 @@ _EXPORTS = {
     "patch_qwen_attention": (
         "rrattn.modules_torch.qwen_patch",
         "patch_qwen_attention",
+    ),
+    "patch_ernie_attention": (
+        "rrattn.modules_torch.ernie_patch",
+        "patch_ernie_attention",
     ),
 }
 

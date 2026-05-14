@@ -90,6 +90,8 @@ def find_blocks_chunked(
     # 0 -- -- -- -- current_index
     # 0 -- -- -- -- -- current_index+1
     # 0 -- -- -- -- -- ----------- current_index + chunk_num - 1
+    if block_num <= 1:
+        return torch.ones_like(input_tensor, dtype=torch.bool)
     if mode == "prefill" and decoding:
         return torch.ones_like(input_tensor, dtype=torch.bool)
     if mode == "decode" and not decoding:

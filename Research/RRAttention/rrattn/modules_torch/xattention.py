@@ -17,10 +17,12 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .kernels import (
-    flat_group_gemm_fuse_reshape,
-    softmax_fuse_block_sum,
+from rrattn.ops.xattention import (
+    flat_group_gemm_fuse_reshape_kernel,
+    softmax_fuse_block_sum_kernel_causal,
+    softmax_fuse_block_sum_kernel_non_causal,
 )
+
 from .utils import find_blocks_chunked
 
 
@@ -75,6 +77,128 @@ def add_estimate_func_time(xattn_estimate_func_time):
     estimate_func_time_ms += xattn_estimate_func_time
 
 
+def softmax_fuse_block_sum(
+    attn_weights_slice,
+    reshaped_block_size,
+    segment_size,
+    chunk_start,
+    chunk_end,
+    real_q_len,
+    scale,
+    is_causal=True,
+):
+    batch_size, num_heads, q_len, k_len = attn_weights_slice.shape
+    assert q_len % reshaped_block_size == 0
+    assert k_len % segment_size == 0
+    assert segment_size % reshaped_block_size == 0
+    assert attn_weights_slice.stride(-1) == 1
+
+    output = torch.empty(
+        (
+            batch_size,
+            num_heads,
+            q_len // reshaped_block_size,
+            k_len // reshaped_block_size,
+        ),
+        dtype=attn_weights_slice.dtype,
+        device=attn_weights_slice.device,
+    )
+
+    grid = (q_len // reshaped_block_size, num_heads, batch_size)
+    if is_causal:
+        softmax_fuse_block_sum_kernel_causal[grid](
+            attn_weights_slice,
+            output,
+            scale,
+            attn_weights_slice.stride(0),
+            attn_weights_slice.stride(1),
+            attn_weights_slice.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            real_q_len,
+            k_len,
+            chunk_start,
+            chunk_end,
+            segment_size,
+            reshaped_block_size,
+        )
+    else:
+        softmax_fuse_block_sum_kernel_non_causal[grid](
+            attn_weights_slice,
+            output,
+            scale,
+            attn_weights_slice.stride(0),
+            attn_weights_slice.stride(1),
+            attn_weights_slice.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            real_q_len,
+            k_len,
+            chunk_start,
+            chunk_end,
+            segment_size,
+            reshaped_block_size,
+        )
+
+    return output
+
+
+def flat_group_gemm_fuse_reshape(
+    query_states, key_states, stride, chunk_start, chunk_end, is_causal=True
+):
+    batch_size, num_heads, q_len, head_dim = query_states.shape
+    kv_len = key_states.shape[2]
+
+    assert key_states.shape[0] == batch_size
+    assert num_heads % key_states.shape[1] == 0
+    assert key_states.shape[3] == head_dim
+    gqa_groups = num_heads // key_states.shape[1]
+    if gqa_groups != 1:
+        key_states = key_states.repeat_interleave(gqa_groups, dim=1)
+
+    output = torch.empty(
+        (batch_size, num_heads, q_len // stride, kv_len // stride),
+        dtype=query_states.dtype,
+        device=query_states.device,
+    )
+    block_m = 128
+    block_n = 128
+    assert q_len % (stride * block_m) == 0
+    assert kv_len % (stride * block_n) == 0
+
+    grid = (
+        q_len // stride // block_m,
+        kv_len // stride // block_n,
+        batch_size * num_heads,
+    )
+    flat_group_gemm_fuse_reshape_kernel[grid](
+        query_states,
+        key_states,
+        output,
+        query_states.stride(0),
+        query_states.stride(1),
+        query_states.stride(2),
+        key_states.stride(0),
+        key_states.stride(1),
+        key_states.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        chunk_start,
+        chunk_end,
+        num_heads,
+        stride,
+        head_dim,
+        block_m,
+        block_n,
+        is_causal,
+    )
+
+    return output
+
+
 def xattn_estimate(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -95,7 +219,9 @@ def xattn_estimate(
 ) -> torch.Tensor:
     batch_size, num_kv_head, k_len, head_dim = key_states.shape
     batch_size, num_q_head, q_len, head_dim = query_states.shape
-    assert num_q_head == num_kv_head
+    assert num_q_head % num_kv_head == 0, (
+        "MHA/GQA requires num_q_head % num_kv_head == 0"
+    )
 
     k_num_to_pad = ((k_len + chunk_size - 1) // chunk_size) * chunk_size - k_len
     q_num_to_pad = ((q_len + chunk_size - 1) // chunk_size) * chunk_size - q_len
@@ -119,7 +245,7 @@ def xattn_estimate(
     else:
         pad_query_states = query_states
 
-    assert num_kv_head == num_q_head
+    gqa_groups = num_q_head // num_kv_head
     attn_sum_list = []
     simple_mask_list = []
 
@@ -236,6 +362,8 @@ def xattn_estimate(
                 dim=-1,
             )
         assert reshaped_key.shape[-2] == k_reshaped_seq_len
+        if num_kv_head != num_q_head:
+            reshaped_key = reshaped_key.repeat_interleave(gqa_groups, dim=1)
 
     for chunk_idx in range(q_chunk_num):
         if use_triton:
@@ -350,7 +478,7 @@ def xattn_estimate(
             attn_sum = (
                 attn_weights_slice.view(
                     batch_size,
-                    num_kv_head,
+                    num_q_head,
                     num_blocks_per_chunk,
                     reshaped_block_size // kdb,
                     -1,
@@ -405,7 +533,7 @@ def xattn_estimate(
         eye_matrix_expanded = (
             eye_matrix.unsqueeze(0)
             .unsqueeze(0)
-            .expand(1, num_kv_head, q_block_num, q_block_num)
+            .expand(1, num_q_head, q_block_num, q_block_num)
         )
         simple_masks[:, :, -q_block_num:, -q_block_num:] = torch.where(
             eye_matrix_expanded,
@@ -432,8 +560,11 @@ def xattn_prefill(
     keep_recent=False,
     layer_idx=None,
 ):
-    batch_size, num_heads, k_len, head_dim = key_states.shape
-    _, _, q_len, _ = query_states.shape
+    batch_size, num_kv_heads, k_len, head_dim = key_states.shape
+    _, num_q_heads, q_len, _ = query_states.shape
+    assert num_q_heads % num_kv_heads == 0, (
+        "MHA/GQA requires num_q_heads % num_kv_heads == 0"
+    )
 
     q_block_num = (q_len + block_size - 1) // block_size
     k_block_num = (k_len + block_size - 1) // block_size
@@ -498,9 +629,13 @@ def xattn_prefill(
     ####################
     assert block_size == 128
     assert batch_size == 1
-    query_states = query_states.transpose(1, 2).view(q_len, num_heads, head_dim)
-    key_states = key_states.transpose(1, 2).view(k_len, num_heads, head_dim)
-    value_states = value_states.transpose(1, 2).view(k_len, num_heads, head_dim)
+    query_states = query_states.transpose(1, 2).view(
+        q_len, num_q_heads, head_dim
+    )
+    key_states = key_states.transpose(1, 2).view(k_len, num_kv_heads, head_dim)
+    value_states = value_states.transpose(1, 2).view(
+        k_len, num_kv_heads, head_dim
+    )
     q_cu_seq_lens = torch.tensor(
         [0, q_len], dtype=torch.int32, device=query_states.device
     )
@@ -508,7 +643,7 @@ def xattn_prefill(
         [0, k_len], dtype=torch.int32, device=query_states.device
     )
     head_mask_type = torch.tensor(
-        [1 for _ in range(num_heads)],
+        [1 for _ in range(num_q_heads)],
         device=query_states.device,
         dtype=torch.int32,
     )
@@ -540,7 +675,7 @@ def xattn_prefill(
         is_causal=causal,
     )
     attn_output = attn_output.view(
-        batch_size, q_len, num_heads, head_dim
+        batch_size, q_len, num_q_heads, head_dim
     ).transpose(1, 2)
     if is_enable_profile():
         # torch.cuda.synchronize()
@@ -551,7 +686,7 @@ def xattn_prefill(
     ################################
 
     del query_states
-    num_to_compute = (k_block_num + 1) * k_block_num / 2 * num_heads
+    num_to_compute = (k_block_num + 1) * k_block_num / 2 * num_q_heads
 
     # print(f"approximated prefilling Computation: {approx_simple_mask.sum() / num_to_compute}")
     sparse_ratio = 1.0 - (approx_simple_mask.sum() / num_to_compute)
