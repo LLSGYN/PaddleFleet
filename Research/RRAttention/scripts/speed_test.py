@@ -143,15 +143,15 @@ def infer_model_type(model_name):
 
 def load_patch(model_type):
     if model_type == "llama":
-        from rrattn.llama_patch import patch_llama_attention
+        from rrattn.modules.llama_patch import patch_llama_attention
 
         return patch_llama_attention
     if model_type == "qwen":
-        from rrattn.qwen_patch import patch_qwen_attention
+        from rrattn.modules.qwen_patch import patch_qwen_attention
 
         return patch_qwen_attention
     if model_type in ("ernie", "ernie_moe"):
-        from rrattn.ernie_patch import patch_ernie_attention
+        from rrattn.modules.ernie_patch import patch_ernie_attention
 
         return patch_ernie_attention
     raise ValueError(f"Unsupported model_type={model_type!r}")
@@ -159,7 +159,7 @@ def load_patch(model_type):
 
 def load_profile_fns(method, enable_profile):
     if method == "xattn":
-        from rrattn.xattention import (
+        from rrattn.modules.xattention import (
             get_attn_time,
             get_estimate_func_time,
             set_attn_time,
@@ -167,7 +167,7 @@ def load_profile_fns(method, enable_profile):
             set_profile,
         )
     elif method == "rrattn":
-        from rrattn.rrattention import (
+        from rrattn.modules.rrattention import (
             get_attn_time,
             get_estimate_func_time,
             set_attn_time,
@@ -175,7 +175,7 @@ def load_profile_fns(method, enable_profile):
             set_profile,
         )
     elif method == "flex":
-        from rrattn.flexprefill import (
+        from rrattn.modules.flexprefill import (
             get_attn_time,
             get_estimate_func_time,
             set_attn_time,
@@ -183,7 +183,7 @@ def load_profile_fns(method, enable_profile):
             set_profile,
         )
     elif method == "full":
-        from rrattn.full_prefill import (
+        from rrattn.modules.full_prefill import (
             get_attn_time,
             get_estimate_func_time,
             set_attn_time,
@@ -205,7 +205,7 @@ def load_profile_fns(method, enable_profile):
 
 
 def load_model(model_name, model_type, dtype):
-    from rrattn.checkpoint_utils import load_pretrained_checkpoint
+    from rrattn.modules.checkpoint_utils import load_pretrained_checkpoint
 
     if model_type == "llama":
         from paddleformers.transformers import LlamaForCausalLM

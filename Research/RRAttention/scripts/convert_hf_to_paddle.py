@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from rrattn.checkpoint_utils import (
+from rrattn.modules.checkpoint_utils import (
     flex_checkpoint_load_lock,
     is_hf_safetensors_checkpoint,
     load_config_for_model,

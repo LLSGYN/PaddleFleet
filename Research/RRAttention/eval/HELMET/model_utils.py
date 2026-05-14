@@ -1179,13 +1179,13 @@ class HFModel(LLM):
                 if record_attn_ms:
                     method = kwargs.get("method", "full")
                     if method == "xattn":
-                        import rrattn.xattention as prefill_mod
+                        import rrattn.modules.xattention as prefill_mod
                     elif method == "rrattn":
-                        import rrattn.rrattention as prefill_mod
+                        import rrattn.modules.rrattention as prefill_mod
                     elif method == "flex":
-                        import rrattn.flexprefill as prefill_mod
+                        import rrattn.modules.flexprefill as prefill_mod
                     else:
-                        import rrattn.full_prefill as prefill_mod
+                        import rrattn.modules.full_prefill as prefill_mod
 
                     reset_estimate_time = prefill_mod.set_estimate_func_time
                     get_estimate_time = prefill_mod.get_estimate_func_time

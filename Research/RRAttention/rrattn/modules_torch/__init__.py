@@ -13,22 +13,22 @@
 # limitations under the License.
 
 _EXPORTS = {
-    "rrattn_estimate": ("rrattn.modules.rrattention", "rrattn_estimate"),
-    "rrattn_prefill": ("rrattn.modules.rrattention", "rrattn_prefill"),
+    "full_prefill": ("rrattn.modules_torch.full_prefill", "full_prefill"),
+    "flash_full_prefill": (
+        "rrattn.modules_torch.full_prefill",
+        "flash_full_prefill",
+    ),
+    "flex_prefill": ("rrattn.modules_torch.flexprefill", "flex_prefill"),
+    "xattn_prefill": ("rrattn.modules_torch.xattention", "xattn_prefill"),
+    "rrattn_prefill": ("rrattn.modules_torch.rrattention", "rrattn_prefill"),
     "patch_llama_attention": (
-        "rrattn.modules.llama_patch",
+        "rrattn.modules_torch.llama_patch",
         "patch_llama_attention",
     ),
     "patch_qwen_attention": (
-        "rrattn.modules.qwen_patch",
+        "rrattn.modules_torch.qwen_patch",
         "patch_qwen_attention",
     ),
-    "patch_ernie_attention": (
-        "rrattn.modules.ernie_patch",
-        "patch_ernie_attention",
-    ),
-    "RRAttnConfig": ("rrattn.modules.rrattention", "RRAttnConfig"),
-    "get_rrattn_config": ("rrattn.modules.rrattention", "get_rrattn_config"),
 }
 
 __all__ = list(_EXPORTS)
